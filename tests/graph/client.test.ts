@@ -9,6 +9,9 @@ vi.mock('../../src/auth/index.js', () => ({
   getAccessToken: vi.fn(async () => 'fake-access-token'),
 }));
 
+const sleepMock = vi.hoisted(() => vi.fn(async (_ms: number) => undefined));
+vi.mock('node:timers/promises', () => ({ setTimeout: sleepMock }));
+
 const fetchMock = vi.fn();
 const originalFetch = globalThis.fetch;
 
@@ -21,11 +24,13 @@ const jsonResponse = (body: unknown, init: ResponseInit = {}): Response =>
 
 beforeEach(() => {
   fetchMock.mockReset();
+  sleepMock.mockClear();
   globalThis.fetch = fetchMock as typeof fetch;
 });
 
 afterEach(() => {
   globalThis.fetch = originalFetch;
+  vi.restoreAllMocks();
 });
 
 describe('graphRequest', () => {
@@ -120,6 +125,136 @@ describe('graphRequest', () => {
     expect(err).toBeInstanceOf(GraphError);
     expect(err.status).toBe(400);
     expect(err.message).toContain('plain text error');
+  });
+});
+
+describe('graphRequest retries and error shaping', () => {
+  const errorResponse = (status: number, headers: Record<string, string> = {}): Response =>
+    new Response(JSON.stringify({ error: { code: `E${status}`, message: `status ${status}` } }), {
+      status,
+      headers: { 'Content-Type': 'application/json', ...headers },
+    });
+
+  it.each([429, 502, 503, 504])('retries a %i response', async (status) => {
+    fetchMock
+      .mockResolvedValueOnce(errorResponse(status, { 'Retry-After': '0' }))
+      .mockResolvedValueOnce(jsonResponse({ ok: true }));
+
+    await expect(graphRequest('/x')).resolves.toEqual({ ok: true });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it.each([400, 401, 403, 409, 500])('does not retry a %i response', async (status) => {
+    fetchMock.mockResolvedValueOnce(errorResponse(status));
+
+    await expect(graphRequest('/x')).rejects.toMatchObject({ status, code: `E${status}` });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(sleepMock).not.toHaveBeenCalled();
+  });
+
+  it('gives up after the initial attempt plus four retries and throws the last error', async () => {
+    for (let i = 0; i < 5; i += 1) {
+      fetchMock.mockResolvedValueOnce(
+        new Response(JSON.stringify({ error: { code: 'Throttled', message: `attempt ${i}` } }), {
+          status: 429,
+          headers: { 'Retry-After': '0' },
+        }),
+      );
+    }
+
+    await expect(graphRequest('/x')).rejects.toMatchObject({
+      status: 429,
+      code: 'Throttled',
+      message: 'attempt 4',
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(5);
+    expect(sleepMock).toHaveBeenCalledTimes(4);
+  });
+
+  it('honours Retry-After in seconds', async () => {
+    fetchMock
+      .mockResolvedValueOnce(errorResponse(503, { 'Retry-After': '3' }))
+      .mockResolvedValueOnce(jsonResponse({}));
+
+    await graphRequest('/x');
+    expect(sleepMock).toHaveBeenCalledWith(3000);
+  });
+
+  it('caps Retry-After at 30 seconds', async () => {
+    fetchMock
+      .mockResolvedValueOnce(errorResponse(429, { 'Retry-After': '3600' }))
+      .mockResolvedValueOnce(jsonResponse({}));
+
+    await graphRequest('/x');
+    expect(sleepMock).toHaveBeenCalledWith(30_000);
+  });
+
+  it.each([
+    ['missing', undefined],
+    ['an HTTP date', 'Wed, 21 Oct 2026 07:28:00 GMT'],
+    ['negative', '-5'],
+  ])('falls back to jittered exponential backoff when Retry-After is %s', async (_label, value) => {
+    vi.spyOn(Math, 'random').mockReturnValue(0.5);
+    const headers: Record<string, string> = value === undefined ? {} : { 'Retry-After': value };
+    for (let i = 0; i < 4; i += 1) fetchMock.mockResolvedValueOnce(errorResponse(503, headers));
+    fetchMock.mockResolvedValueOnce(jsonResponse({}));
+
+    await graphRequest('/x');
+    expect(sleepMock.mock.calls.map(([ms]) => ms)).toEqual([250, 500, 1000, 2000]);
+  });
+
+  it('carries the request-id header onto the GraphError', async () => {
+    fetchMock.mockResolvedValueOnce(errorResponse(404, { 'request-id': 'req-abc' }));
+
+    await expect(graphRequest('/x')).rejects.toMatchObject({ requestId: 'req-abc' });
+  });
+
+  it('falls back to the status line when the error body is empty', async () => {
+    fetchMock.mockResolvedValueOnce(new Response('', { status: 403, statusText: 'Forbidden' }));
+
+    const err = await graphRequest('/x').catch((e: unknown) => e as GraphError);
+    expect(err.message).toBe('Graph request failed with 403 Forbidden');
+    expect(err.code).toBeUndefined();
+    expect(err.requestId).toBeUndefined();
+  });
+
+  it('keeps the status line message when the error object has a code but no message', async () => {
+    fetchMock.mockResolvedValueOnce(
+      new Response(JSON.stringify({ error: { code: 'BadThing' } }), {
+        status: 400,
+        statusText: 'Bad Request',
+      }),
+    );
+
+    await expect(graphRequest('/x')).rejects.toMatchObject({
+      code: 'BadThing',
+      message: 'Graph request failed with 400 Bad Request',
+    });
+  });
+
+  it('uses the raw text when the JSON body has no error envelope', async () => {
+    const body = JSON.stringify({ detail: 'something odd' });
+    fetchMock.mockResolvedValueOnce(new Response(body, { status: 400 }));
+
+    await expect(graphRequest('/x')).rejects.toMatchObject({ message: body, code: undefined });
+  });
+
+  it('truncates long non-JSON error bodies to 500 characters', async () => {
+    fetchMock.mockResolvedValueOnce(new Response('x'.repeat(2000), { status: 400 }));
+
+    const err = await graphRequest('/x').catch((e: unknown) => e as GraphError);
+    expect(err.message).toBe('x'.repeat(500));
+  });
+
+  it('keeps the status line message when the error body cannot be read', async () => {
+    const response = new Response('ignored', { status: 400, statusText: 'Bad Request' });
+    vi.spyOn(response, 'text').mockRejectedValue(new Error('socket hang up'));
+    fetchMock.mockResolvedValueOnce(response);
+
+    await expect(graphRequest('/x')).rejects.toMatchObject({
+      status: 400,
+      message: 'Graph request failed with 400 Bad Request',
+    });
   });
 });
 
