@@ -87,7 +87,7 @@ Open the URL, paste the code, sign in with the Microsoft account whose OneNote y
 To sign out:
 
 ```sh
-npx @onelastcommit/onenote-mcp logout
+ONENOTE_MCP_CLIENT_ID=<your-app-client-id> npx @onelastcommit/onenote-mcp logout
 ```
 
 ### 3. Wire it into your MCP client
@@ -192,7 +192,7 @@ curl -X POST -H "Authorization: Bearer $ONENOTE_MCP_HTTP_TOKEN" \
      http://127.0.0.1:3000/mcp
 ```
 
-Sign in with `npx @onelastcommit/onenote-mcp login` (one-time, on the host running the server) before any tools are invoked — the device-code flow is the same as the stdio path and caches tokens at `~/.config/onenote-mcp/tokens.json`. The bearer token is **server↔client auth only**; the Microsoft Graph credentials still come from the cached refresh token.
+Sign in with `ONENOTE_MCP_CLIENT_ID=<your-app-client-id> npx @onelastcommit/onenote-mcp login` (one-time, on the host running the server) before any tools are invoked — the device-code flow is the same as the stdio path and caches tokens at `~/.config/onenote-mcp/tokens.json`. The bearer token is **server↔client auth only**; the Microsoft Graph credentials still come from the cached refresh token.
 
 On a headless host (a container, a PaaS) there's no terminal for the device-code login. Run `login` on your laptop instead, then pass the resulting `tokens.json` to the server via the `ONENOTE_MCP_TOKEN_CACHE` env var — on first boot in HTTP mode the server seeds its cache from it. The [deployment guides](#self-hosting) walk through this.
 
@@ -305,7 +305,7 @@ It's idempotent: reuses (or creates) a notebook called **OneNote MCP Smoke Test*
 
 If you're using an AI coding assistant (Claude Code, Cursor, etc.), see [`CLAUDE.md`](CLAUDE.md) for project conventions, the arrow-function rule, and the tool-authoring checklist.
 
-Commits follow [Conventional Commits](https://www.conventionalcommits.org/) (`feat:`, `fix:`, `chore:`, etc.). CI runs typecheck + lint + test + build on every push and PR.
+Commits follow [Conventional Commits](https://www.conventionalcommits.org/) (`feat:`, `fix:`, `chore:`, etc.). CI runs typecheck + lint + test + build on every push to `main` and every PR.
 
 ### Roadmap
 
