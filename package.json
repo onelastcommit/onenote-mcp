@@ -70,10 +70,10 @@
     "@vitest/coverage-v8": "2.1.9",
     "concurrently": "^9.2.5",
     "eslint": "^9.22.0",
-    "tsc-alias": "^1.9.9",
+    "tsc-alias": "^1.9.10",
     "tsx": "^4.23.15",
     "typescript": "^5.6.3",
-    "typescript-eslint": "^8.72.0",
+    "typescript-eslint": "^8.72.1",
     "vitest": "^2.1.4"
   }
 }
