@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1
 
 # --- build: compile TypeScript to dist/ ---
-FROM node:24-alpine AS build
+FROM node:26-alpine AS build
 WORKDIR /app
 COPY package.json yarn.lock ./
 RUN yarn install --frozen-lockfile
@@ -10,13 +10,13 @@ COPY src ./src
 RUN yarn build
 
 # --- deps: production-only node_modules ---
-FROM node:24-alpine AS deps
+FROM node:26-alpine AS deps
 WORKDIR /app
 COPY package.json yarn.lock ./
 RUN yarn install --frozen-lockfile --production && yarn cache clean
 
 # --- runtime ---
-FROM node:24-alpine AS runtime
+FROM node:26-alpine AS runtime
 ENV NODE_ENV=production
 ENV ONENOTE_MCP_HTTP_HOST=0.0.0.0
 ENV ONENOTE_MCP_HTTP_PORT=3000
