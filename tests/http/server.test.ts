@@ -7,11 +7,18 @@ import {
   getHttpPort,
   getHttpToken,
 } from '@/config.js';
-import { startHttpServer, type RunningHttpServer } from '@/http/server.js';
+import { createHttpServer, startHttpServer, type RunningHttpServer } from '@/http/server.js';
+import { createServer as createMcpServer } from '@/index.js';
+import type * as McpIndex from '@/index.js';
 
 vi.mock('../../src/auth/index.js', () => ({
   getAccessToken: vi.fn(async () => 'fake-access-token'),
 }));
+
+vi.mock('../../src/index.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof McpIndex>();
+  return { ...actual, createServer: vi.fn(actual.createServer) };
+});
 
 const TOKEN = 'test-bearer-token-do-not-use';
 
@@ -52,6 +59,7 @@ describe('HTTP server', () => {
   let base: string;
 
   beforeEach(async () => {
+    vi.mocked(createMcpServer).mockClear();
     server = await startHttpServer({ host: '127.0.0.1', port: 0, token: TOKEN });
     base = `http://127.0.0.1:${server.port}`;
   });
@@ -139,6 +147,209 @@ describe('HTTP server', () => {
       headers: { Authorization: `Bearer ${TOKEN}` },
     });
     expect(res.status).toBe(404);
+  });
+
+  it('unknown paths return a JSON not_found body with a matching Content-Length', async () => {
+    const res = await fetch(`${base}/nope`);
+    const text = await res.text();
+    expect(res.headers.get('content-type')).toBe('application/json');
+    expect(res.headers.get('content-length')).toBe(Buffer.byteLength(text).toString());
+    expect(JSON.parse(text)).toEqual({ error: 'not_found' });
+  });
+
+  it('GET /healthz ignores the query string', async () => {
+    const res = await fetch(`${base}/healthz?probe=liveness`);
+    expect(res.status).toBe(200);
+  });
+
+  it('non-GET /healthz is not treated as a health check', async () => {
+    const res = await fetch(`${base}/healthz`, { method: 'POST' });
+    expect(res.status).toBe(404);
+  });
+
+  it.each([
+    ['a trailing slash', '/mcp/'],
+    ['a different case', '/MCP'],
+    ['a sub-path', '/mcp/extra'],
+  ])('/mcp with %s is not routed to the MCP handler', async (_label, path) => {
+    const res = await fetch(`${base}${path}`, {
+      method: 'POST',
+      headers: mcpHeaders(TOKEN),
+      body: JSON.stringify(initializePayload),
+    });
+    expect(res.status).toBe(404);
+    expect(createMcpServer).not.toHaveBeenCalled();
+  });
+
+  it('a query string on /mcp does not bypass the auth gate', async () => {
+    const res = await fetch(`${base}/mcp?token=${TOKEN}`, {
+      method: 'POST',
+      headers: mcpHeaders(undefined),
+      body: JSON.stringify(initializePayload),
+    });
+    expect(res.status).toBe(401);
+    expect(await res.json()).toEqual({ error: 'unauthorized' });
+    expect(createMcpServer).not.toHaveBeenCalled();
+  });
+
+  it('a query string on /mcp is still served when the token is valid', async () => {
+    const res = await fetch(`${base}/mcp?session=1`, {
+      method: 'POST',
+      headers: mcpHeaders(TOKEN),
+      body: JSON.stringify(initializePayload),
+    });
+    expect(res.status).toBe(200);
+  });
+
+  it('the auth gate applies to every method on /mcp', async () => {
+    for (const method of ['GET', 'DELETE', 'PUT']) {
+      const res = await fetch(`${base}/mcp`, { method });
+      expect(res.status).toBe(401);
+    }
+    expect(createMcpServer).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['the bare token without a scheme', TOKEN],
+    ['a lower-case scheme', `bearer ${TOKEN}`],
+    ['a different scheme', `Basic ${TOKEN}`],
+    ['a token prefix', `Bearer ${TOKEN.slice(0, -1)}`],
+    ['a token with a trailing extra character', `Bearer ${TOKEN}x`],
+    ['an empty bearer token', 'Bearer '],
+    // Same string length as the real header, but é is two bytes once UTF-8 encoded.
+    ['a same-length token with a multi-byte character', `Bearer ${TOKEN.slice(0, -1)}é`],
+  ])('POST /mcp with %s returns 401', async (_label, authorization) => {
+    const res = await fetch(`${base}/mcp`, {
+      method: 'POST',
+      headers: { ...mcpHeaders(undefined), Authorization: authorization },
+      body: JSON.stringify(initializePayload),
+    });
+    expect(res.status).toBe(401);
+    expect(createMcpServer).not.toHaveBeenCalled();
+  });
+
+  it('builds a fresh MCP server for every authorised request', async () => {
+    for (let i = 0; i < 2; i += 1) {
+      const res = await fetch(`${base}/mcp`, {
+        method: 'POST',
+        headers: mcpHeaders(TOKEN),
+        body: JSON.stringify(initializePayload),
+      });
+      expect(res.status).toBe(200);
+      await res.text();
+    }
+    expect(createMcpServer).toHaveBeenCalledTimes(2);
+  });
+
+  it('returns a 500 internal_error when the MCP server cannot be built', async () => {
+    vi.mocked(createMcpServer).mockImplementationOnce(() => {
+      throw new Error('tool registration exploded');
+    });
+    const res = await fetch(`${base}/mcp`, {
+      method: 'POST',
+      headers: mcpHeaders(TOKEN),
+      body: JSON.stringify(initializePayload),
+    });
+    expect(res.status).toBe(500);
+    expect(res.headers.get('content-type')).toBe('application/json');
+    expect(await res.json()).toEqual({
+      error: 'internal_error',
+      message: 'tool registration exploded',
+    });
+  });
+
+  it('stringifies non-Error failures in the 500 body', async () => {
+    vi.mocked(createMcpServer).mockImplementationOnce(() => {
+      throw 'plain string failure';
+    });
+    const res = await fetch(`${base}/mcp`, {
+      method: 'POST',
+      headers: mcpHeaders(TOKEN),
+      body: JSON.stringify(initializePayload),
+    });
+    expect(res.status).toBe(500);
+    expect(await res.json()).toEqual({
+      error: 'internal_error',
+      message: 'plain string failure',
+    });
+  });
+
+  it('keeps serving requests after one of them failed', async () => {
+    vi.mocked(createMcpServer).mockImplementationOnce(() => {
+      throw new Error('transient');
+    });
+    const failed = await fetch(`${base}/mcp`, {
+      method: 'POST',
+      headers: mcpHeaders(TOKEN),
+      body: JSON.stringify(initializePayload),
+    });
+    expect(failed.status).toBe(500);
+    await failed.text();
+
+    const res = await fetch(`${base}/mcp`, {
+      method: 'POST',
+      headers: mcpHeaders(TOKEN),
+      body: JSON.stringify(initializePayload),
+    });
+    expect(res.status).toBe(200);
+    const body = (await parseMcpResponseBody(res)) as { result: { serverInfo: { name: string } } };
+    expect(body.result.serverInfo.name).toBe('onenote-mcp');
+  });
+
+  it('ends the response instead of hanging when a failure happens after headers were sent', async () => {
+    const actual = await vi.importActual<typeof McpIndex>('@/index.js');
+    vi.mocked(createMcpServer).mockImplementationOnce(() => {
+      const mcp = actual.createServer();
+      mcp.close = async () => {
+        throw new Error('close failed');
+      };
+      return mcp;
+    });
+    const res = await fetch(`${base}/mcp`, {
+      method: 'POST',
+      headers: mcpHeaders(TOKEN),
+      body: JSON.stringify(initializePayload),
+      signal: AbortSignal.timeout(3000),
+    });
+    expect(res.status).toBe(200);
+    const body = (await parseMcpResponseBody(res)) as { result: { serverInfo: { name: string } } };
+    expect(body.result.serverInfo.name).toBe('onenote-mcp');
+  });
+});
+
+describe('HTTP server lifecycle', () => {
+  it('createHttpServer refuses an empty bearer token', () => {
+    expect(() => createHttpServer({ host: '127.0.0.1', port: 0, token: '' })).toThrow(
+      /non-empty bearer token/,
+    );
+  });
+
+  it('startHttpServer reports the bound port and MCP URL when asked for port 0', async () => {
+    const running = await startHttpServer({ host: '127.0.0.1', port: 0, token: TOKEN });
+    try {
+      expect(running.port).toBeGreaterThan(0);
+      expect(running.url).toBe(`http://127.0.0.1:${running.port}/mcp`);
+    } finally {
+      await running.close();
+    }
+  });
+
+  it('startHttpServer rejects when the port is already in use', async () => {
+    const first = await startHttpServer({ host: '127.0.0.1', port: 0, token: TOKEN });
+    try {
+      await expect(
+        startHttpServer({ host: '127.0.0.1', port: first.port, token: TOKEN }),
+      ).rejects.toMatchObject({ code: 'EADDRINUSE' });
+    } finally {
+      await first.close();
+    }
+  });
+
+  it('close stops the listener and rejects when called twice', async () => {
+    const running = await startHttpServer({ host: '127.0.0.1', port: 0, token: TOKEN });
+    await running.close();
+    await expect(fetch(`http://127.0.0.1:${running.port}/healthz`)).rejects.toThrow();
+    await expect(running.close()).rejects.toMatchObject({ code: 'ERR_SERVER_NOT_RUNNING' });
   });
 });
 
